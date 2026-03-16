@@ -276,6 +276,67 @@ class MemoQClient:
             logger.error(f"Failed to get segments: {e}")
             return []
 
+    def list_projects(
+        self,
+        workflow_stage: Optional[str] = None,
+    ) -> List[MemoQProject]:
+        """
+        List all accessible projects, optionally filtered by workflow stage.
+
+        Args:
+            workflow_stage: Optional workflow stage filter
+
+        Returns:
+            List of MemoQProject objects
+        """
+        try:
+            wsdl_url = f"{self.ws_api_url}/ServerProjectService?wsdl"
+
+            transport = Transport(session=self.session, timeout=self.timeout)
+            client = SOAPClient(wsdl_url, transport=transport)
+
+            result = client.service.ListProjects(
+                authToken=self.auth_token,
+            )
+
+            projects = []
+            if result:
+                for proj in result:
+                    stage = None
+                    if hasattr(proj, "WorkflowStatus") and proj.WorkflowStatus:
+                        try:
+                            stage = WorkflowStage(proj.WorkflowStatus.lower())
+                        except ValueError:
+                            pass
+
+                    if workflow_stage and stage and stage.value != workflow_stage.lower():
+                        continue
+
+                    projects.append(
+                        MemoQProject(
+                            project_guid=proj.ProjectGuid,
+                            name=proj.Name,
+                            source_lang=proj.SourceLanguageCode,
+                            target_langs=list(proj.TargetLanguageCodes)
+                            if hasattr(proj, "TargetLanguageCodes")
+                            else [],
+                            workflow_stage=stage,
+                            created_date=proj.CreatedTime
+                            if hasattr(proj, "CreatedTime")
+                            else None,
+                            deadline=proj.Deadline
+                            if hasattr(proj, "Deadline")
+                            else None,
+                        )
+                    )
+
+            logger.info(f"Listed {len(projects)} projects")
+            return projects
+
+        except Exception as e:
+            logger.error(f"Failed to list projects: {e}")
+            return []
+
     def get_termbases(self, project_guid: str) -> List[str]:
         """
         Get list of termbase GUIDs attached to a project.

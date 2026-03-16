@@ -8,6 +8,7 @@ Provides standalone, service, and API modes for quality checking.
 import sys
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 from loguru import logger
 
@@ -207,23 +208,101 @@ def run_service(args, config_loader: ConfigLoader, components: dict):
     """Run in service mode - monitor workflow and process automatically."""
     import time
 
+    memoq_client = components["memoq_client"]
     workflow_handler = components["workflow_handler"]
     workflow_config = config_loader.get_workflow_config()
 
     polling_interval = workflow_config.get("polling_interval", 60)
+    trigger_stage = workflow_config.get("trigger", "pre_proofreading")
+    state_file = Path(workflow_config.get("state_file", "./data/service_state.json"))
 
     logger.info(f"Starting service mode (polling every {polling_interval}s)")
+    logger.info(f"Monitoring stage: {trigger_stage}")
     logger.info("Press Ctrl+C to stop")
 
-    # TODO: Implement workflow monitoring
-    # This would require:
-    # 1. Query MemoQ for projects/documents at specified workflow stage
-    # 2. Check if they've already been processed (track in database)
-    # 3. Process new items
-    # 4. Update tracking database
+    # Load processed items state
+    state_file.parent.mkdir(parents=True, exist_ok=True)
 
-    print("Service mode is not yet fully implemented.")
-    print("This would monitor MemoQ workflow and automatically process documents.")
+    def load_state() -> dict:
+        if state_file.exists():
+            with open(state_file) as f:
+                return json.load(f)
+        return {"processed_documents": {}}
+
+    def save_state(state: dict):
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+
+    state = load_state()
+    processed_documents: dict = state.get("processed_documents", {})
+
+    logger.info(
+        f"Loaded state: {len(processed_documents)} previously processed documents"
+    )
+
+    while True:
+        try:
+            logger.info("Polling MemoQ for projects...")
+
+            projects = memoq_client.list_projects(workflow_stage=trigger_stage)
+            logger.info(f"Found {len(projects)} project(s) at stage '{trigger_stage}'")
+
+            for project in projects:
+                try:
+                    documents = memoq_client.get_documents(project.project_guid)
+
+                    for doc in documents:
+                        doc_key = f"{project.project_guid}:{doc.document_guid}"
+
+                        if doc_key in processed_documents:
+                            logger.debug(
+                                f"Skipping already-processed document {doc.name}"
+                            )
+                            continue
+
+                        logger.info(
+                            f"Processing document '{doc.name}' "
+                            f"in project '{project.name}'"
+                        )
+
+                        result = workflow_handler.process_document(
+                            project_guid=project.project_guid,
+                            document_guid=doc.document_guid,
+                            workflow_stage=trigger_stage,
+                        )
+
+                        # Record as processed
+                        processed_documents[doc_key] = {
+                            "project_name": project.name,
+                            "document_name": doc.name,
+                            "processed_at": datetime.utcnow().isoformat(),
+                            "quality_score": result.overall_score,
+                            "recommendation": result.recommendation,
+                        }
+
+                        # Persist state after each document
+                        save_state({"processed_documents": processed_documents})
+
+                        # Save report
+                        save_report(result, config_loader)
+
+                        logger.info(
+                            f"Document '{doc.name}' processed: "
+                            f"score={result.overall_score:.1f}, "
+                            f"{result.recommendation}"
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to process project {project.project_guid}: {e}"
+                    )
+                    continue
+
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+
+        logger.debug(f"Sleeping {polling_interval}s until next poll...")
+        time.sleep(polling_interval)
 
 
 def run_api(args, config_loader: ConfigLoader, components: dict):
